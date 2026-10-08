@@ -925,7 +925,7 @@ public final class BLEManager: NSObject, ObservableObject {
     private var unexpectedImuStopAt = Date.distantPast
     /// True while the user-started continuous WHOOP 4.0 100 Hz IMU CSV log runs: keep-alive and
     /// reconnect re-arm the stream, and the Live tab / overnight window leave R10/R11 armed.
-    private var whoop4ImuStreamWanted = false
+    private var imuStreamWanted = false
     /// Ordered queue of frames awaiting drain through the serial Backfiller task.
     private var backfillFrameQueue: [[UInt8]] = []
     /// True while the drain task is running (prevents a second drain task from launching).
@@ -2223,7 +2223,7 @@ public final class BLEManager: NSObject, ObservableObject {
     /// Start a manually stopped 5/MG raw-data session. Returns false when another capture is active.
     @discardableResult
     public func startGroundTruthRawCapture(sessionId: String) -> Bool {
-        guard !rawCaptureInFlight else { return false }
+        guard !rawCaptureInFlight, !imuStreamWanted else { return false }
         rawCaptureInFlight = true
         send(.startRawData, payload: [0x01], writeType: .withResponse)
         send(.toggleIMUMode,
@@ -2246,40 +2246,52 @@ public final class BLEManager: NSObject, ObservableObject {
         log("Raw-data session: stopped + flushed")
     }
 
-    /// Start the continuous WHOOP 4.0 100 Hz accel+gyro CSV log (Diagnostics). Returns false on a
-    /// non-4.0 strap or when no log folder has been chosen. Runs until `stopWhoop4ImuStream()`.
+    /// Start the continuous 100 Hz accel+gyro CSV log (Diagnostics) on a WHOOP 4.0 or 5.0/MG. Returns
+    /// false on another strap family, while a Test Centre raw-data session owns the IMU producer, or when
+    /// no log folder has been chosen. Runs until `stopImuStream()`.
     @discardableResult
-    public func startWhoop4ImuStream() -> Bool {
-        guard selectedModel.deviceFamily == .whoop4, Whoop4ImuStreamLogger.shared.start() else { return false }
-        whoop4ImuStreamWanted = true
-        armWhoop4ImuStream()
-        log("WHOOP 4 IMU stream: logging to \(Whoop4ImuStreamLogger.shared.folder?.path ?? "?") every \(Whoop4ImuStreamLogger.shared.intervalSeconds) s (0 = continuous)")
+    public func startImuStream() -> Bool {
+        let family = selectedModel.deviceFamily
+        guard family == .whoop4 || family == .whoop5, !rawCaptureInFlight,
+              ImuStreamLogger.shared.start() else { return false }
+        imuStreamWanted = true
+        armImuStream()
+        log("IMU stream (\(family == .whoop5 ? "5/MG" : "4.0")): logging to \(ImuStreamLogger.shared.folder?.path ?? "?") every \(ImuStreamLogger.shared.intervalSeconds) s (0 = continuous)")
         return true
     }
 
-    public func stopWhoop4ImuStream() {
-        guard whoop4ImuStreamWanted else { return }
-        whoop4ImuStreamWanted = false
-        send(.toggleIMUMode, payload: [0x01, 0x00], writeType: .withResponse)
-        send(.stopRawData, payload: [0x01], writeType: .withResponse)
-        if !screenWantsRealtime { send(.sendR10R11Realtime, payload: [0x00]) }
-        Whoop4ImuStreamLogger.shared.stop()
-        log("WHOOP 4 IMU stream: stopped (\(Whoop4ImuStreamLogger.shared.framesWritten) s written)")
+    public func stopImuStream() {
+        guard imuStreamWanted else { return }
+        // Clear the want only AFTER the stop writes: the 5/MG send allowlist admits 81/82/106 on it.
+        defer { imuStreamWanted = false }
+        if selectedModel.deviceFamily == .whoop5 {
+            // Documented 5/MG stop order: STOP_RAW_DATA, then TOGGLE_IMU_MODE [01, 00].
+            send(.stopRawData, payload: [0x01], writeType: .withResponse)
+            send(.toggleIMUMode, payload: [0x01, 0x00], writeType: .withResponse)
+        } else {
+            send(.toggleIMUMode, payload: [0x01, 0x00], writeType: .withResponse)
+            send(.stopRawData, payload: [0x01], writeType: .withResponse)
+            if !screenWantsRealtime { send(.sendR10R11Realtime, payload: [0x00]) }
+        }
+        rawCaptureStoppedAt = Date()   // the 5/MG fail-safe ignores in-flight frames for 3 s after a stop
+        ImuStreamLogger.shared.stop()
+        log("IMU stream: stopped (\(ImuStreamLogger.shared.framesWritten) s written)")
     }
 
-    /// WHOOP 4 IMU arm: START_RAW_DATA(81), TOGGLE_IMU_MODE(106) `[01, state]`, R10/R11 output (63).
-    /// Idempotent, so keep-alive and reconnect re-send it to keep the stream from lapsing.
-    private func armWhoop4ImuStream() {
+    /// IMU arm: START_RAW_DATA(81) then TOGGLE_IMU_MODE(106) `[01, 01]` on both families (5/MG needs
+    /// the 81 first or 106 only acknowledges); WHOOP 4 also needs the R10/R11 output (63) on.
+    /// Idempotent, so reconnect (both) and keep-alive (4.0) re-send it to keep the stream from lapsing.
+    private func armImuStream() {
         send(.startRawData, payload: [0x01], writeType: .withResponse)
         send(.toggleIMUMode, payload: [0x01, 0x01], writeType: .withResponse)
-        send(.sendR10R11Realtime, payload: [0x01])
+        if selectedModel.deviceFamily == .whoop4 { send(.sendR10R11Realtime, payload: [0x01]) }
     }
 
     /// Stop a realtime IMU producer left armed after a crash, lost stop write, or another client.
     private func stopUnexpectedRealtimeImu(_ frame: [UInt8], isOffload: Bool, now: Date = Date()) {
         guard selectedModel.deviceFamily == .whoop5, !isOffload, frame.count > 8,
               frame[8] == 43 || frame[8] == 51,
-              !rawCaptureInFlight, !UserDefaults.standard.bool(forKey: "enableRawCapture"),
+              !rawCaptureInFlight, !imuStreamWanted, !UserDefaults.standard.bool(forKey: "enableRawCapture"),
               now.timeIntervalSince(rawCaptureStoppedAt) >= 3,
               now.timeIntervalSince(unexpectedImuStopAt) >= 30 else { return }
         unexpectedImuStopAt = now
@@ -2376,9 +2388,9 @@ public final class BLEManager: NSObject, ObservableObject {
                 || (DeviceConfigReadProbe.isReadOnlyOpcode(command.rawValue) && deviceConfigReport != nil)
                 || command == .sendHistoricalData || command == .historicalDataResult
                 || command == .setClock || command == .getClock
-                // Bounded Raw Data Collector only. These writes remain impossible unless the explicit
-                // user-started capture window is in flight; normal sync never enables this gate.
-                || (rawCaptureInFlight && (command == .startRawData
+                // Bounded Raw Data Collector or the user-started Diagnostics IMU log only. These writes remain
+                // impossible unless one of those explicit captures is in flight; normal sync never enables it.
+                || ((rawCaptureInFlight || imuStreamWanted) && (command == .startRawData
                     || command == .stopRawData || command == .toggleIMUMode))
                 // SET_CONFIG / SET_FF_VALUE (120), ENABLE direction — the R22 deep-stream unlock. Allowed
                 // only while the deep-data experiment is opted in, and only for a KEY and a VALUE the gate
@@ -3316,7 +3328,7 @@ public final class BLEManager: NSObject, ObservableObject {
         // Always stop the heavy R10/R11 burst when the Live screen leaves — it's the battery-hungry part
         // and is only ever wanted while a live screen is up. The lightweight TOGGLE/0x2A37 R-R stream is
         // what continuous capture keeps; the reconciler decides whether to disarm that.
-        if !whoop4ImuStreamWanted { send(.sendR10R11Realtime, payload: [0x00]) }
+        if !imuStreamWanted { send(.sendR10R11Realtime, payload: [0x00]) }
         reconcileRealtime()
     }
 
@@ -4842,7 +4854,7 @@ public final class BLEManager: NSObject, ObservableObject {
             if captureWantNow {
                 log("Continuous HRV: overnight window opened; arming the realtime stream (#927)")
             } else {
-                if !whoop4ImuStreamWanted { send(.sendR10R11Realtime, payload: [0x00]) }   // like stopRealtime
+                if !imuStreamWanted { send(.sendR10R11Realtime, payload: [0x00]) }   // like stopRealtime
                 log("Continuous HRV: overnight window closed; realtime stream disarmed until tonight (#927)")
             }
         }
@@ -4858,7 +4870,7 @@ public final class BLEManager: NSObject, ObservableObject {
             send(.sendR10R11Realtime, payload: [0x01])
             send(.toggleRealtimeHR, payload: [0x01])
         }   // re-arm so it can't lapse
-        if whoop4ImuStreamWanted { armWhoop4ImuStream() }
+        if imuStreamWanted { armImuStream() }
         keepAliveTick += 1
         // #battery: ~60 s normally, ~30 s while charging (see `batteryPollDue`).
         //
@@ -6898,6 +6910,9 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
             // only this block is gated. `whoop5SessionStarted` resets on disconnect.
             if !whoop5SessionStarted {
                 whoop5SessionStarted = true
+                // A reconnect mid-log: the strap dropped its IMU producer with the link, so re-arm it. Here
+                // (once per connection), not above: this branch re-enters on every .withResponse ack.
+                if imuStreamWanted { armImuStream() }
                 connectHandshakeDone = true     // unblocks beginBackfill()'s guard
                 state.historyReady = true       // and the sync controls, which must not offer what it declines
                 log("WHOOP 5/MG: connect handshake done — backfill unblocked")
@@ -6986,7 +7001,7 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
             send(.getClock, payload: [0x00])
         }
         send(.sendR10R11Realtime, payload: [0x00])   // stop the type-43 realtime flood (BLE airtime/battery)
-        if whoop4ImuStreamWanted { armWhoop4ImuStream() }   // …unless the user is logging the IMU stream
+        if imuStreamWanted { armImuStream() }   // …unless the user is logging the IMU stream
         send(.getDataRange)                          // refresh the strap's stored range for the watchdog
         // Plain offload (no high-freq-sync), rate-limited (first connect always runs; reconnect-flaps are
         // throttled by BackfillPolicy). Deferred ~1.5s so SET_CLOCK/GET_DATA_RANGE round-trip first and
@@ -7353,7 +7368,7 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
                 let parsed = parseFrame(frame, family: .whoop4)
                 router.handle(parsed: parsed, frame: frame)       // live/UI path
                 // Type-43 IMU frames feed the Live tab's motion cards always, and the CSV log while it runs.
-                Whoop4ImuStreamLogger.shared.ingest(frame, crcOK: parsed.ok, clockRef: clockRef)
+                ImuStreamLogger.shared.ingest(frame, crcOK: parsed.ok, clockRef: clockRef)
                 //
                 // WHAT IS AND IS NOT GATED BELOW (standing risk, recorded rather than fixed here).
                 //
@@ -7486,6 +7501,8 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
                         continue
                     }
                     router.handle(frame: frame)
+                    // Live (never offload) 1,244-byte raw-IMU buffers feed the Live motion cards + the CSV log.
+                    ImuStreamLogger.shared.ingestWhoop5(frame, clockRef: clockRef)
                     // The same split as the WHOOP 4.0 loop above, and for the same reasons: the probe
                     // dispatches below branch on a raw opcode compare; the ones that verify do it inside
                     // their own decoder, the extended-battery / body-location probes and the write-ack

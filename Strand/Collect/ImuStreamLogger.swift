@@ -1,20 +1,25 @@
 import Foundation
+import WhoopProtocol
 import WhoopStore
 
-/// Continuous WHOOP 4.0 100 Hz IMU logger: decodes each realtime type-43 frame in the 1,917-byte
-/// IMU layout (docs/PROTOCOL_SENSORS.md "WHOOP 4 realtime raw layouts") and writes the samples into
-/// a user-chosen folder as one CSV per logging interval, named by the interval's UTC start time
-/// (e.g. `whoop4-imu-20261008T075304Z.csv`). Interval 0 is "continuous": one CSV per session, named by
-/// its first second, with each second's rows appended as the frame arrives.
+/// Continuous 100 Hz IMU logger for WHOOP 4.0 and 5.0/MG: decodes each live 1-second, 6-axis IMU
+/// frame and writes the samples into a user-chosen folder as one CSV per logging interval, named by
+/// the strap family and the interval's UTC start time (e.g. `whoop5-imu-20261008T075304Z.csv`).
+/// Interval 0 is "continuous": one CSV per session, named by its first second, with each second's rows
+/// appended as the frame arrives.
 ///
-/// Frame layout (WHOOP 4 frame-absolute offsets, declared length 1,924):
+/// WHOOP 5.0/MG frames are the 1,244-byte raw-IMU buffer decoded by `Whoop5RawImu` (strap seconds @15,
+/// accel @28/@228/@428, gyro @640/@840/@1040, same scales); that layout has no mapped subsecond or HR
+/// field, so those two columns are left empty.
+///
+/// WHOOP 4.0 frame layout (realtime type-43, 1,917-byte IMU variant, frame-absolute, declared length 1,924):
 ///   @4 type 43 · @11 u32 LE device seconds · @15 u16 LE subseconds (unit not calibrated) · @21 HR
 ///   (offsets per whoop_protocol.json REALTIME_RAW_DATA; docs/PROTOCOL_SENSORS.md lists them 4 bytes late)
 ///   @89/@289/@489 100×i16 accel X/Y/Z (1/4096 g) · @692/@892/@1092 100×i16 gyro X/Y/Z (2000/32768 °/s)
 /// Both scales are commonly applied interpretations, not confirmed device parameters; the raw i16
 /// counts are logged alongside so nothing is lost if the scale turns out wrong.
 @MainActor
-final class Whoop4ImuStreamLogger: ObservableObject {
+final class ImuStreamLogger: ObservableObject {
     /// The most recent decoded second of IMU data, for the Live tab's accelerometer/gyro cards.
     struct Snapshot {
         let receivedAt: Date
@@ -23,7 +28,7 @@ final class Whoop4ImuStreamLogger: ObservableObject {
         let gyro: [[Double]]
     }
 
-    static let shared = Whoop4ImuStreamLogger()
+    static let shared = ImuStreamLogger()
 
     static let declaredLength = 1_924, sampleCount = 100
     static let accelScale = 1.0 / 4096.0, gyroScale = 2000.0 / 32768.0
@@ -63,6 +68,8 @@ final class Whoop4ImuStreamLogger: ObservableObject {
     private var wallOffset: Int?
     private var pendingBucket: Int?
     private var pendingRows = ""
+    /// `whoop4` / `whoop5`, from the session's first frame; prefixes every CSV name.
+    private var filePrefix = "whoop4"
     /// Continuous mode: the open session file, created on the first frame.
     private var continuousHandle: FileHandle?
 
@@ -120,7 +127,15 @@ final class Whoop4ImuStreamLogger: ObservableObject {
         isActive = false
     }
 
-    /// Consume one notify frame if it is a CRC-valid WHOOP 4 type-43 IMU frame. `clockRef` maps the
+    /// One decoded second: strap seconds, optional subsecond/HR, and [ax, ay, az, gx, gy, gz] × 100 raw counts.
+    private struct Second {
+        let deviceTs: UInt32
+        let subsec: Int?
+        let hr: Int?
+        let columns: [[Int16]]
+    }
+
+    /// Consume one WHOOP 4.0 notify frame if it is a CRC-valid type-43 IMU frame. `clockRef` maps the
     /// strap's device seconds to wall time; without it the first frame's host time anchors the session.
     func ingest(_ f: [UInt8], crcOK: Bool, clockRef: ClockRef?) {
         guard f.count > 4, f[0] == 0xAA, f[4] == 43 else { return }
@@ -129,20 +144,45 @@ final class Whoop4ImuStreamLogger: ObservableObject {
             if isActive { framesSkipped += 1 }
             return
         }
-        let deviceTs = u32(f, Self.tsOff)
+        let columns = (Self.accelOffs + Self.gyroOffs).map { off in
+            (0..<Self.sampleCount).map { i16(f, off + 2 * $0) }
+        }
+        consume(Second(deviceTs: u32(f, Self.tsOff),
+                       subsec: Int(f[Self.subsecOff]) | Int(f[Self.subsecOff + 1]) << 8,
+                       hr: Int(f[Self.hrOff]), columns: columns),
+                family: "whoop4", clockRef: clockRef)
+    }
+
+    /// Consume one live WHOOP 5.0/MG notify frame if it is a CRC-valid 1,244-byte raw-IMU buffer.
+    /// Callers must not pass history-offload frames: banked buffers would land in today's CSVs.
+    func ingestWhoop5(_ f: [UInt8], clockRef: ClockRef?) {
+        guard f.count == Whoop5RawImu.bufferLength else { return }
+        guard verifyFrame(f, family: .whoop5).ok, let raw = Whoop5RawImu.rawColumns(f),
+              let ts = Whoop5RawImu.baseTs(f) else {
+            if isActive { framesSkipped += 1 }
+            return
+        }
+        let n = Whoop5RawImu.sampleCount
+        let columns = (0..<6).map { c in Array(raw[(c * n)..<((c + 1) * n)]) }
+        consume(Second(deviceTs: UInt32(truncatingIfNeeded: ts), subsec: nil, hr: nil, columns: columns),
+                family: "whoop5", clockRef: clockRef)
+    }
+
+    private func consume(_ sec: Second, family: String, clockRef: ClockRef?) {
         // The strap can resend a second; keep strictly one block per device second.
-        if deviceTs == lastDeviceTs { return }
-        lastDeviceTs = deviceTs
+        if sec.deviceTs == lastDeviceTs { return }
+        lastDeviceTs = sec.deviceTs
         latest = Snapshot(
             receivedAt: Date(),
-            accel: Self.accelOffs.map { off in (0..<Self.sampleCount).map { Double(i16(f, off + 2 * $0)) * Self.accelScale } },
-            gyro: Self.gyroOffs.map { off in (0..<Self.sampleCount).map { Double(i16(f, off + 2 * $0)) * Self.gyroScale } })
+            accel: sec.columns[0..<3].map { $0.map { Double($0) * Self.accelScale } },
+            gyro: sec.columns[3..<6].map { $0.map { Double($0) * Self.gyroScale } })
         guard isActive else { return }
+        if framesWritten == 0 { filePrefix = family }
         let hostMs = Int64(Date().timeIntervalSince1970 * 1_000)
-        let offset = clockRef.map { $0.wall - $0.device } ?? wallOffset ?? (Int(hostMs / 1_000) - Int(deviceTs))
+        let offset = clockRef.map { $0.wall - $0.device } ?? wallOffset ?? (Int(hostMs / 1_000) - Int(sec.deviceTs))
         wallOffset = offset
-        let wallSec = Int(deviceTs) + offset
-        let rows = rows(f, deviceTs: deviceTs, wallSec: wallSec, hostMs: hostMs)
+        let wallSec = Int(sec.deviceTs) + offset
+        let rows = rows(sec, wallSec: wallSec, hostMs: hostMs)
         framesWritten += 1
         if intervalSeconds == 0 { appendContinuous(rows, wallSec: wallSec); return }
         let bucket = wallSec - wallSec % intervalSeconds
@@ -153,18 +193,17 @@ final class Whoop4ImuStreamLogger: ObservableObject {
         if wallSec == bucket + intervalSeconds - 1 { flushPending() }
     }
 
-    private func rows(_ f: [UInt8], deviceTs: UInt32, wallSec: Int, hostMs: Int64) -> String {
-        let subsec = Int(f[Self.subsecOff]) | Int(f[Self.subsecOff + 1]) << 8
-        let hr = f[Self.hrOff]
+    private func rows(_ sec: Second, wallSec: Int, hostMs: Int64) -> String {
+        let subsec = sec.subsec.map(String.init) ?? "", hr = sec.hr.map(String.init) ?? ""
+        let n = sec.columns[0].count
         var out = ""
-        out.reserveCapacity(Self.sampleCount * 120)
-        for i in 0..<Self.sampleCount {
-            let a = Self.accelOffs.map { i16(f, $0 + 2 * i) }
-            let g = Self.gyroOffs.map { i16(f, $0 + 2 * i) }
-            let wall = String(format: "%.2f", Double(wallSec) + Double(i) / Double(Self.sampleCount))
+        out.reserveCapacity(n * 120)
+        for i in 0..<n {
+            let a = sec.columns[0..<3].map { $0[i] }, g = sec.columns[3..<6].map { $0[i] }
+            let wall = String(format: "%.2f", Double(wallSec) + Double(i) / Double(n))
             let scaled = a.map { String(format: "%.5f", Double($0) * Self.accelScale) }
                 + g.map { String(format: "%.3f", Double($0) * Self.gyroScale) }
-            out += "\(hostMs),\(deviceTs),\(subsec),\(wall),\(i),\(scaled.joined(separator: ",")),"
+            out += "\(hostMs),\(sec.deviceTs),\(subsec),\(wall),\(i),\(scaled.joined(separator: ",")),"
                 + "\((a + g).map(String.init).joined(separator: ",")),\(hr)\n"
         }
         return out
@@ -174,7 +213,7 @@ final class Whoop4ImuStreamLogger: ObservableObject {
         defer { pendingBucket = nil; pendingRows = "" }
         guard let bucket = pendingBucket, !pendingRows.isEmpty, let folder else { return }
         let stamp = Self.nameFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(bucket)))
-        let name = "whoop4-imu-\(stamp).csv"
+        let name = "\(filePrefix)-imu-\(stamp).csv"
         let url = folder.appendingPathComponent(name)
         do {
             try Data((Self.header + pendingRows).utf8).write(to: url, options: .atomic)
@@ -187,7 +226,7 @@ final class Whoop4ImuStreamLogger: ObservableObject {
     private func appendContinuous(_ rows: String, wallSec: Int) {
         if continuousHandle == nil {
             guard let folder else { return }
-            let name = "whoop4-imu-\(Self.nameFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(wallSec)))).csv"
+            let name = "\(filePrefix)-imu-\(Self.nameFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(wallSec)))).csv"
             let url = folder.appendingPathComponent(name)
             guard FileManager.default.createFile(atPath: url.path, contents: Data(Self.header.utf8)),
                   let handle = try? FileHandle(forWritingTo: url) else {

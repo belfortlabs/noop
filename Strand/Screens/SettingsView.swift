@@ -27,7 +27,7 @@ struct SettingsView: View {
     /// Custom background image (#custom-background). The store owns the decoded image + toggles; the
     /// picker selection + the file-importer flag are local UI state.
     @ObservedObject private var backgroundStore = BackgroundImageStore.shared
-    @ObservedObject private var imuLogger = Whoop4ImuStreamLogger.shared
+    @ObservedObject private var imuLogger = ImuStreamLogger.shared
     @State private var backgroundPickerItem: PhotosPickerItem?
     @State private var showBackgroundFileImporter = false
 
@@ -2066,7 +2066,7 @@ struct SettingsView: View {
                 }
                 #endif
 
-                // MARK: Continuous WHOOP 4.0 100 Hz IMU log — one timestamped CSV per interval in a chosen folder.
+                // MARK: Continuous WHOOP 4.0 / 5.0 100 Hz IMU log — one timestamped CSV per interval in a chosen folder.
                 NoopButton(imuLogger.folder == nil ? "Choose IMU log folder…" : "Change IMU log folder…",
                            systemImage: "folder.badge.gearshape", kind: .secondary) {
                     chooseImuLogFolder()
@@ -2078,19 +2078,19 @@ struct SettingsView: View {
                 }
                 #endif
                 Picker("New CSV every", selection: $imuLogger.intervalSeconds) {
-                    ForEach(Whoop4ImuStreamLogger.intervalChoices, id: \.self) { s in
+                    ForEach(ImuStreamLogger.intervalChoices, id: \.self) { s in
                         if s == 0 { Text("Continuous (one file)").tag(s) } else { Text(verbatim: "\(s) s").tag(s) }
                     }
                 }
                 .disabled(imuLogger.isActive)
                 if imuLogger.isActive {
                     NoopButton("Stop 100 Hz IMU log", systemImage: "stop.fill", kind: .destructive) {
-                        model.ble.stopWhoop4ImuStream()
+                        model.ble.stopImuStream()
                     }
                 } else {
-                    NoopButton("Start 100 Hz IMU log (WHOOP 4.0)", systemImage: "waveform.path.ecg",
+                    NoopButton("Start 100 Hz IMU log", systemImage: "waveform.path.ecg",
                                kind: .primary) {
-                        _ = model.ble.startWhoop4ImuStream()
+                        _ = model.ble.startImuStream()
                     }
                     .disabled(imuLogger.folder == nil || !live.bonded)
                 }

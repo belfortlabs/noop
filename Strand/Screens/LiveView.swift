@@ -1395,13 +1395,13 @@ private enum LiveSyncFormat {
     }
 }
 
-// MARK: - Motion cards (WHOOP 4.0 100 Hz IMU)
+// MARK: - Motion cards (WHOOP 100 Hz IMU)
 
 /// Accelerometer + gyroscope cards under the Signal Trust rail: the newest sample per axis and a trace
-/// of the last received second (100 samples). Fed by `Whoop4ImuStreamLogger`, which sees every type-43
-/// IMU frame; frames only flow while the IMU stream is armed (Settings → Diagnostics → IMU log).
+/// of the last received second (100 samples). Fed by `ImuStreamLogger`, which sees every live WHOOP 4.0
+/// / 5.0 IMU frame; frames only flow while the IMU stream is armed (Settings → Diagnostics → IMU log).
 private struct LiveMotionCards: View {
-    @ObservedObject private var imu = Whoop4ImuStreamLogger.shared
+    @ObservedObject private var imu = ImuStreamLogger.shared
 
     var body: some View {
         LazyVGrid(columns: [GridItem(.adaptive(minimum: 280), spacing: NoopMetrics.gap)],
@@ -1471,7 +1471,7 @@ private struct MotionAxisCard: View {
                         .frame(height: 56)
                         .opacity(fresh ? 1 : 0.4)
                 } else {
-                    Text("No motion data yet. Start the 100 Hz IMU log in Settings → Diagnostics to stream it from a WHOOP 4.0.")
+                    Text("No motion data yet. Start the 100 Hz IMU log in Settings → Diagnostics to stream it from your WHOOP.")
                         .font(StrandFont.footnote)
                         .foregroundStyle(StrandPalette.textTertiary)
                         .fixedSize(horizontal: false, vertical: true)
