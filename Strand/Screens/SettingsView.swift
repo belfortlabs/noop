@@ -27,6 +27,7 @@ struct SettingsView: View {
     /// Custom background image (#custom-background). The store owns the decoded image + toggles; the
     /// picker selection + the file-importer flag are local UI state.
     @ObservedObject private var backgroundStore = BackgroundImageStore.shared
+    @ObservedObject private var imuLogger = Whoop4ImuStreamLogger.shared
     @State private var backgroundPickerItem: PhotosPickerItem?
     @State private var showBackgroundFileImporter = false
 
@@ -204,6 +205,7 @@ struct SettingsView: View {
     /// macOS can "Reveal in Finder" after a share, mirroring the puffin-capture export.
     @State private var rawCsvBusy = false
     @State private var lastRawCsvURL: URL?
+    @State private var showImuFolderImporter = false
 
     /// Passive WHOOP 5/MG optical experiment: the picker writes local timestamp markers into the
     /// durable deep-buffer JSONL. It never calls a BLE write path.
@@ -2064,12 +2066,73 @@ struct SettingsView: View {
                 }
                 #endif
 
+                // MARK: Continuous WHOOP 4.0 100 Hz IMU log — one timestamped CSV per interval in a chosen folder.
+                NoopButton(imuLogger.folder == nil ? "Choose IMU log folder…" : "Change IMU log folder…",
+                           systemImage: "folder.badge.gearshape", kind: .secondary) {
+                    chooseImuLogFolder()
+                }
+                .disabled(imuLogger.isActive)
+                #if os(iOS)
+                .fileImporter(isPresented: $showImuFolderImporter, allowedContentTypes: [.folder]) { result in
+                    if case .success(let url) = result { imuLogger.setFolder(url) }
+                }
+                #endif
+                Picker("New CSV every", selection: $imuLogger.intervalSeconds) {
+                    ForEach(Whoop4ImuStreamLogger.intervalChoices, id: \.self) { s in
+                        if s == 0 { Text("Continuous (one file)").tag(s) } else { Text(verbatim: "\(s) s").tag(s) }
+                    }
+                }
+                .disabled(imuLogger.isActive)
+                if imuLogger.isActive {
+                    NoopButton("Stop 100 Hz IMU log", systemImage: "stop.fill", kind: .destructive) {
+                        model.ble.stopWhoop4ImuStream()
+                    }
+                } else {
+                    NoopButton("Start 100 Hz IMU log (WHOOP 4.0)", systemImage: "waveform.path.ecg",
+                               kind: .primary) {
+                        _ = model.ble.startWhoop4ImuStream()
+                    }
+                    .disabled(imuLogger.folder == nil || !live.bonded)
+                }
+                if let folder = imuLogger.folder {
+                    Text(verbatim: "\(folder.path) · \(imuLogger.framesWritten) s received · \(imuLogger.filesWritten) files · \(imuLogger.framesSkipped) non-IMU frames"
+                         + (imuLogger.lastFileName.map { " · last: \($0)" } ?? ""))
+                        .font(StrandFont.caption)
+                        .foregroundStyle(StrandPalette.textTertiary)
+                        .textSelection(.enabled)
+                    if let error = imuLogger.lastError {
+                        Text(verbatim: error)
+                            .font(StrandFont.caption)
+                            .foregroundStyle(StrandPalette.statusCritical)
+                    }
+                    #if os(macOS)
+                    NoopButton("Reveal IMU log folder in Finder", systemImage: "folder", kind: .secondary) {
+                        NSWorkspace.shared.activateFileViewerSelecting([folder])
+                    }
+                    #endif
+                }
+
                 Text("Dumps the last 24 hours of decoded per-sample sensor streams (heart rate, R-R, motion, steps, SpO₂, skin temperature, respiration, events) to a single CSV. All on \(Platform.deviceNounPhrase), nothing uploaded. Share it to help prototype and test sleep, activity and strength algorithms.")
                     .font(StrandFont.caption)
                     .foregroundStyle(StrandPalette.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
+    }
+
+    /// Ask for the folder the WHOOP 4.0 IMU logger writes its per-interval CSVs into.
+    private func chooseImuLogFolder() {
+        #if os(macOS)
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Use Folder"
+        if panel.runModal() == .OK, let url = panel.url { imuLogger.setFolder(url) }
+        #else
+        showImuFolderImporter = true
+        #endif
     }
 
     /// Export the last 24h of decoded sensor streams for the connected strap to a CSV, then save (macOS

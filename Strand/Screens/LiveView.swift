@@ -326,6 +326,7 @@ struct LiveView: View {
         VStack(alignment: .leading, spacing: NoopMetrics.gap) {
             SectionHeader("Signal Trust", overline: "Proof that the console is current")
             LiveSignalTrustRail(activeConnection: activeConnection, activeIsWhoop: activeIsWhoop)
+            if activeIsWhoop { LiveMotionCards() }
         }
     }
 
@@ -1391,6 +1392,126 @@ private enum LiveSyncFormat {
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .short
         return formatter.localizedString(for: date, relativeTo: Date())
+    }
+}
+
+// MARK: - Motion cards (WHOOP 4.0 100 Hz IMU)
+
+/// Accelerometer + gyroscope cards under the Signal Trust rail: the newest sample per axis and a trace
+/// of the last received second (100 samples). Fed by `Whoop4ImuStreamLogger`, which sees every type-43
+/// IMU frame; frames only flow while the IMU stream is armed (Settings → Diagnostics → IMU log).
+private struct LiveMotionCards: View {
+    @ObservedObject private var imu = Whoop4ImuStreamLogger.shared
+
+    var body: some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 280), spacing: NoopMetrics.gap)],
+                  spacing: NoopMetrics.gap) {
+            MotionAxisCard(title: "Accelerometer", unit: "g", format: "%+.3f", minRange: 1.2,
+                           axes: imu.latest?.accel, receivedAt: imu.latest?.receivedAt)
+            MotionAxisCard(title: "Gyroscope", unit: "°/s", format: "%+.1f", minRange: 30,
+                           axes: imu.latest?.gyro, receivedAt: imu.latest?.receivedAt)
+        }
+    }
+}
+
+private struct MotionAxisCard: View {
+    @AppStorage(CardAppearancePrefs.opacityKey) private var cardOpacityPercent = CardAppearancePrefs.defaultPercent
+    private var cardOpacity: Double { max(0, min(1, Double(cardOpacityPercent) / 100)) }
+
+    let title: String
+    let unit: String
+    let format: String
+    /// Smallest half-range of the trace, so a resting signal isn't blown up into noise.
+    let minRange: Double
+    /// [x, y, z] × samples, or nil before the first IMU frame.
+    let axes: [[Double]]?
+    let receivedAt: Date?
+
+    private static let names = ["X", "Y", "Z"]
+    private static var colors: [Color] { [StrandPalette.metricRose, StrandPalette.statusPositive, StrandPalette.metricCyan] }
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            let age = receivedAt.map { context.date.timeIntervalSince($0) }
+            let fresh = (age ?? .infinity) < 3
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    Text(title.uppercased())
+                        .font(StrandFont.overline)
+                        .tracking(StrandFont.overlineTracking)
+                        .foregroundStyle(StrandPalette.textSecondary)
+                    Spacer(minLength: 0)
+                    Text(statusText(age))
+                        .font(StrandFont.footnote)
+                        .foregroundStyle(fresh ? StrandPalette.accent : StrandPalette.textTertiary)
+                }
+                if let axes {
+                    HStack(spacing: 16) {
+                        ForEach(0..<3, id: \.self) { a in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(verbatim: Self.names[a])
+                                    .font(StrandFont.overline)
+                                    .foregroundStyle(Self.colors[a])
+                                Text(verbatim: String(format: format, axes[a].last ?? 0))
+                                    .font(StrandFont.bodyNumber)
+                                    .foregroundStyle(fresh ? StrandPalette.textPrimary : StrandPalette.textTertiary)
+                            }
+                        }
+                        Spacer(minLength: 0)
+                        VStack(alignment: .trailing, spacing: 2) {
+                            Text(verbatim: "|\(title.prefix(1))|")
+                                .font(StrandFont.overline)
+                                .foregroundStyle(StrandPalette.textSecondary)
+                            Text(verbatim: String(format: format, magnitude(axes)) + " " + unit)
+                                .font(StrandFont.bodyNumber)
+                                .foregroundStyle(fresh ? StrandPalette.textPrimary : StrandPalette.textTertiary)
+                        }
+                    }
+                    trace(axes)
+                        .frame(height: 56)
+                        .opacity(fresh ? 1 : 0.4)
+                } else {
+                    Text("No motion data yet. Start the 100 Hz IMU log in Settings → Diagnostics to stream it from a WHOOP 4.0.")
+                        .font(StrandFont.footnote)
+                        .foregroundStyle(StrandPalette.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .padding(14)
+        .frame(minHeight: 112, alignment: .top)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(NoopPanelSurface(cornerRadius: 20, surfaceOpacity: cardOpacity))
+    }
+
+    private func statusText(_ age: TimeInterval?) -> String {
+        guard let age else { return "100 Hz · waiting" }
+        return age < 3 ? "100 Hz · live" : "\(Int(age)) s ago"
+    }
+
+    private func magnitude(_ axes: [[Double]]) -> Double {
+        (axes.map { ($0.last ?? 0) * ($0.last ?? 0) }.reduce(0, +)).squareRoot()
+    }
+
+    /// The last second of all three axes on a shared, zero-centred scale.
+    private func trace(_ axes: [[Double]]) -> some View {
+        let peak = max(minRange, axes.flatMap { $0 }.map(abs).max() ?? 0)
+        return Canvas { ctx, size in
+            let mid = size.height / 2
+            var zero = Path()
+            zero.move(to: CGPoint(x: 0, y: mid)); zero.addLine(to: CGPoint(x: size.width, y: mid))
+            ctx.stroke(zero, with: .color(StrandPalette.textTertiary.opacity(0.4)), lineWidth: 0.5)
+            for (a, series) in axes.enumerated() where series.count > 1 {
+                var path = Path()
+                for (i, v) in series.enumerated() {
+                    let p = CGPoint(x: size.width * CGFloat(i) / CGFloat(series.count - 1),
+                                    y: mid - CGFloat(v / peak) * (mid - 1))
+                    if i == 0 { path.move(to: p) } else { path.addLine(to: p) }
+                }
+                ctx.stroke(path, with: .color(Self.colors[a]), lineWidth: 1.2)
+            }
+        }
+        .accessibilityHidden(true)
     }
 }
 

@@ -130,6 +130,8 @@ targets:
         com.apple.security.app-sandbox: true
         com.apple.security.device.bluetooth: true
         com.apple.security.files.user-selected.read-write: true
+        # Remembers the user-chosen WHOOP 4.0 IMU log folder across launches (security-scoped bookmark).
+        com.apple.security.files.bookmarks.app-scope: true
         # Outbound client access — used ONLY by the opt-in, consent-gated, BYOK AI Coach.
         # The ad-hoc distributed build applies NO entitlements (unsigned build + ad-hoc
         # re-sign), so this matters only for a SIGNED/sandboxed build (where the sandbox
